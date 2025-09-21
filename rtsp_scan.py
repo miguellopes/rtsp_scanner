@@ -521,7 +521,7 @@ def main() -> None:
     )
     parser.add_argument("target_ip", nargs="?", help="The IP address of the target camera to scan.")
     parser.add_argument("-f", "--ip-file", dest="ip_file", help="Path to a file containing IP addresses to scan.")
-    parser.add_argument("--db-path", default="camxploit_results.db", help="Path to the SQLite database file.")
+    parser.add_argument("--db-path", default="results.db", help="Path to the SQLite database file.")
     parser.add_argument(
         "-t",
         "--threads",
