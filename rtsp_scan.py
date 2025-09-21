@@ -2,12 +2,15 @@ import argparse
 import base64
 import ipaddress
 import json
+import os
 import socket
 import sqlite3
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from threading import Event, Lock
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 TIMEOUT = 5
 RTSP_PORT = 554
@@ -217,6 +220,22 @@ RTSP_PATHS: List[str] = [
 ]
 
 
+class ScanAborted(Exception):
+    """Raised when a scan should stop early due to a user request."""
+
+
+class ScanLogger:
+    def __init__(self) -> None:
+        self._lines: List[str] = []
+
+    def log(self, message: str) -> None:
+        self._lines.append(message)
+
+    @property
+    def lines(self) -> List[str]:
+        return self._lines
+
+
 def load_ips_from_file(path: str) -> List[str]:
     ips: List[str] = []
     try:
@@ -260,6 +279,18 @@ def flatten_credentials() -> List[str]:
             if combo not in combos:
                 combos.append(combo)
     return combos
+
+
+def load_scanned_ips_from_db(db_path: str) -> Set[str]:
+    if not os.path.exists(db_path):
+        return set()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute("SELECT DISTINCT ip FROM rtsp_scan_results")
+            return {row[0] for row in cursor.fetchall() if row[0]}
+    except sqlite3.Error as exc:
+        print(f"{Y}[!] Unable to read previous scan results from {db_path}: {exc}{W}")
+        return set()
 
 
 def send_rtsp_describe(ip: str, port: int, path: str, credential: Optional[str] = None) -> Tuple[Optional[int], str]:
@@ -310,36 +341,50 @@ def send_rtsp_describe(ip: str, port: int, path: str, credential: Optional[str] 
     return None, decoded
 
 
-def brute_force_rtsp_paths(ip: str, port: int, credentials: List[str]) -> Tuple[List[Dict[str, object]], List[Dict[str, str]], List[Dict[str, object]]]:
-    print(f"\n{C}[🔍] Brute forcing RTSP paths on {ip}:{port}{W}")
+def brute_force_rtsp_paths(
+    ip: str,
+    port: int,
+    credentials: List[str],
+    *,
+    log: Optional[Callable[[str], None]] = None,
+    stop_event: Optional[Event] = None,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, str]], List[Dict[str, object]]]:
+    logger = log or print
+    logger(f"\n{C}[🔍] Brute forcing RTSP paths on {ip}:{port}{W}")
     discovered: List[Dict[str, object]] = []
     credential_hits: List[Dict[str, str]] = []
     other_responses: List[Dict[str, object]] = []
     credentials_attempted_for_path: Dict[str, bool] = {}
 
     for index, path in enumerate(RTSP_PATHS, start=1):
+        if stop_event and stop_event.is_set():
+            logger(f"  {Y}[!] Stop requested. Aborting remaining path attempts on {ip}{W}")
+            raise ScanAborted()
         url = f"rtsp://{ip}:{port}{path if path.startswith('/') else '/' + path}"
         status, response = send_rtsp_describe(ip, port, path)
         if status is None:
-            print(f"  {Y}[!] {path} -> no valid response ({response}){W}")
+            logger(f"  {Y}[!] {path} -> no valid response ({response}){W}")
             other_responses.append({"url": url, "note": response})
             continue
 
         if status == 200:
-            print(f"  {G}[+] Discovered stream without auth: {url}{W}")
+            logger(f"  {G}[+] Discovered stream without auth: {url}{W}")
             discovered.append({"url": url, "requires_auth": False, "status": status})
         elif status == 401:
             #print(f"  {Y}[-] Authentication required for {url}{W}")
             if credentials_attempted_for_path.get(ip):
                 continue
-            print(f"  {Y}[-] Trying creds")
+            logger(f"  {Y}[-] Trying creds")
             credentials_attempted_for_path[ip] = True
             found = False
             for credential in credentials:
+                if stop_event and stop_event.is_set():
+                    logger(f"  {Y}[!] Stop requested while attempting credentials on {ip}{W}")
+                    raise ScanAborted()
                 time.sleep(0.05)
                 auth_status, _ = send_rtsp_describe(ip, port, path, credential=credential)
                 if auth_status == 200:
-                    print(f"    {G}[+] Credentials succeeded ({credential}) for {url}{W}")
+                    logger(f"    {G}[+] Credentials succeeded ({credential}) for {url}{W}")
                     discovered.append({
                         "url": url,
                         "requires_auth": True,
@@ -354,7 +399,7 @@ def brute_force_rtsp_paths(ip: str, port: int, credentials: List[str]) -> Tuple[
             if not found:
                 other_responses.append({"url": url, "status": 401})
         else:
-            print(f"  {M}[*] {url} -> status {status}{W}")
+            logger(f"  {M}[*] {url} -> status {status}{W}")
             other_responses.append({"url": url, "status": status})
 
         if index % 20 == 0:
@@ -405,6 +450,70 @@ def save_results_to_db(db_path: str, results: Dict[str, object]) -> None:
         )
 
 
+def scan_target(
+    target_ip: str,
+    *,
+    credentials: List[str],
+    db_path: str,
+    stop_event: Event,
+    output_lock: Lock,
+    position: int,
+    total: int,
+) -> None:
+    logger = ScanLogger()
+    if total > 1:
+        logger.log(f"\n{M}=== Processing target {position}/{total}: {target_ip} ==={W}")
+    else:
+        logger.log(f"\n{M}=== Processing target: {target_ip} ==={W}")
+
+    result: Dict[str, object] = {
+        "ip": target_ip,
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "port_open": False,
+        "discovered_paths": [],
+        "credential_hits": [],
+        "other_responses": [],
+    }
+
+    try:
+        if stop_event.is_set():
+            raise ScanAborted()
+
+        if is_port_open(target_ip, RTSP_PORT):
+            logger.log(f"{G}[+] Port {RTSP_PORT} is open on {target_ip}{W}")
+            result["port_open"] = True
+            discovered, creds, other = brute_force_rtsp_paths(
+                target_ip,
+                RTSP_PORT,
+                credentials,
+                log=logger.log,
+                stop_event=stop_event,
+            )
+            result["discovered_paths"] = discovered
+            result["credential_hits"] = creds
+            result["other_responses"] = other
+            if not discovered:
+                logger.log(f"{Y}[-] No valid RTSP paths discovered on {target_ip}{W}")
+        else:
+            logger.log(f"{R}[-] Port {RTSP_PORT} is closed or unreachable on {target_ip}{W}")
+
+        if stop_event.is_set():
+            raise ScanAborted()
+
+        save_results_to_db(db_path, result)
+        logger.log(f"{C}[✅] Scan completed for {target_ip}{W}")
+    except ScanAborted:
+        logger.log(f"{Y}[!] Scan for {target_ip} aborted by user request.{W}")
+        raise
+    except Exception as exc:
+        logger.log(f"{R}[!] Unexpected error while scanning {target_ip}: {exc}{W}")
+        raise
+    finally:
+        with output_lock:
+            for line in logger.lines:
+                print(line)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="CamScan - Targeted RTSP exposure scanner",
@@ -413,63 +522,122 @@ def main() -> None:
     parser.add_argument("target_ip", nargs="?", help="The IP address of the target camera to scan.")
     parser.add_argument("-f", "--ip-file", dest="ip_file", help="Path to a file containing IP addresses to scan.")
     parser.add_argument("--db-path", default="camxploit_results.db", help="Path to the SQLite database file.")
+    parser.add_argument(
+        "-t",
+        "--threads",
+        type=int,
+        default=4,
+        help="Number of concurrent scan threads to use (default: 4).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip targets that already exist in the database.",
+    )
     args = parser.parse_args()
 
-    targets: List[str] = []
-    if args.target_ip:
-        targets.append(args.target_ip.strip())
-    if args.ip_file:
-        targets.extend(load_ips_from_file(args.ip_file))
+    if args.threads < 1:
+        parser.error("Number of threads must be at least 1.")
 
-    if not targets:
+    requested_targets: List[str] = []
+    if args.target_ip:
+        requested_targets.append(args.target_ip.strip())
+    if args.ip_file:
+        requested_targets.extend(load_ips_from_file(args.ip_file))
+
+    if not requested_targets:
         parser.error("You must provide a target IP or an IP list file.")
+
+    unique_targets: List[str] = []
+    seen: Set[str] = set()
+    for target in requested_targets:
+        stripped = target.strip()
+        if not stripped or stripped in seen:
+            continue
+        if not validate_ip(stripped):
+            continue
+        unique_targets.append(stripped)
+        seen.add(stripped)
+
+    if not unique_targets:
+        print(f"{R}[!] No valid IP addresses to scan.{W}")
+        return
+
+    if args.resume:
+        scanned_ips = load_scanned_ips_from_db(args.db_path)
+        if scanned_ips:
+            before = len(unique_targets)
+            unique_targets = [ip for ip in unique_targets if ip not in scanned_ips]
+            skipped = before - len(unique_targets)
+            if skipped:
+                print(f"{Y}[!] Skipping {skipped} target(s) already stored in {args.db_path}{W}")
+            else:
+                print(f"{C}[*] No matching completed scans found in {args.db_path}{W}")
+        else:
+            print(f"{C}[*] No existing scan entries found in {args.db_path}. Starting fresh.{W}")
+
+    total_targets = len(unique_targets)
+    if total_targets == 0:
+        print(f"{G}[!] All requested targets have already been scanned.{W}")
+        return
 
     print(BANNER)
     print("____________________________________________________________________________\n")
     print(f"{C}[💾] Results will be stored in: {args.db_path}{W}")
+    if args.threads > 1:
+        print(f"{C}[*] Running with up to {args.threads} concurrent scan threads.{W}")
 
     credentials = flatten_credentials()
+    output_lock = Lock()
+    stop_event = Event()
 
-    for index, target_ip in enumerate(targets, start=1):
-        if not target_ip:
-            continue
-        if not validate_ip(target_ip):
-            continue
+    future_to_ip: Dict[object, str] = {}
 
-        if len(targets) > 1:
-            print(f"\n{M}=== Processing target {index}/{len(targets)}: {target_ip} ==={W}")
-        else:
-            print(f"\n{M}=== Processing target: {target_ip} ==={W}")
+    try:
+        with ThreadPoolExecutor(max_workers=args.threads) as executor:
+            try:
+                for position, target_ip in enumerate(unique_targets, start=1):
+                    if stop_event.is_set():
+                        break
+                    future = executor.submit(
+                        scan_target,
+                        target_ip,
+                        credentials=credentials,
+                        db_path=args.db_path,
+                        stop_event=stop_event,
+                        output_lock=output_lock,
+                        position=position,
+                        total=total_targets,
+                    )
+                    future_to_ip[future] = target_ip
 
-        result: Dict[str, object] = {
-            "ip": target_ip,
-            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            "port_open": False,
-            "discovered_paths": [],
-            "credential_hits": [],
-            "other_responses": [],
-        }
-
-        if is_port_open(target_ip, RTSP_PORT):
-            print(f"{G}[+] Port {RTSP_PORT} is open on {target_ip}{W}")
-            result["port_open"] = True
-            discovered, creds, other = brute_force_rtsp_paths(target_ip, RTSP_PORT, credentials)
-            result["discovered_paths"] = discovered
-            result["credential_hits"] = creds
-            result["other_responses"] = other
-            if not discovered:
-                print(f"{Y}[-] No valid RTSP paths discovered on {target_ip}{W}")
-        else:
-            print(f"{R}[-] Port {RTSP_PORT} is closed or unreachable on {target_ip}{W}")
-
-        save_results_to_db(args.db_path, result)
-        print(f"{C}[✅] Scan completed for {target_ip}{W}")
+                for future in as_completed(future_to_ip):
+                    if stop_event.is_set():
+                        break
+                    try:
+                        future.result()
+                    except ScanAborted:
+                        continue
+                    except Exception as exc:
+                        with output_lock:
+                            print(f"{R}[!] Scan task for {future_to_ip[future]} failed: {exc}{W}")
+            except KeyboardInterrupt:
+                stop_event.set()
+                with output_lock:
+                    print(f"\n{Y}[!] Stop requested. Waiting for running scans to finish...{W}")
+                raise
+    except KeyboardInterrupt:
+        for future, ip in future_to_ip.items():
+            try:
+                future.result()
+            except ScanAborted:
+                continue
+            except Exception as exc:
+                with output_lock:
+                    print(f"{R}[!] Scan task for {ip} failed: {exc}{W}")
+        print(f"{Y}[!] Scan stopped before all targets were processed. Re-run with --resume to continue.{W}")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print(f"\n{R}[!] Scan aborted by user{W}")
-        sys.exit(1)
+    main()
 
